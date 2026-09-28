@@ -1,0 +1,117 @@
+<!-- Created: 2026-09-28 21:42 -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Digit Recognizer</title>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/ort.min.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; background: #f4f4f4; color: #222; display: grid; place-items: center; min-height: 100vh; margin: 0; text-align: center; }
+  canvas { background: #000; border-radius: 8px; touch-action: none; cursor: crosshair; max-width: calc(100vw - 32px); }
+  #result { font-size: 32px; font-weight: 700; margin: 12px 0 4px; }
+  #confidence { font-size: 20px; min-height: 1.3em; }
+  #others { color: #777; font-family: monospace; min-height: 1.3em; }
+  button { font-size: 16px; padding: 8px 24px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<main>
+  <canvas id="pad" width="280" height="280"></canvas>
+  <div id="result">Loading model...</div>
+  <div id="confidence"></div>
+  <div id="others"></div>
+  <button id="clear">Clear</button>
+</main>
+<script>
+const MEAN = 0.1307, STD = 0.3081;  // MNIST normalization, same as training
+const pad = document.getElementById('pad');
+const ctx = pad.getContext('2d', { willReadFrequently: true });
+const $ = id => document.getElementById(id);
+let session = null, drawing = false;
+
+// Preprocess like MNIST (mirrors to_mnist() in desktop_version/digits.py):
+// crop to ink, fit in 20x20, paste into 28x28, center by center of mass, normalize.
+function toMnist() {
+  const { data } = ctx.getImageData(0, 0, pad.width, pad.height);
+  let minX = pad.width, minY = pad.height, maxX = -1, maxY = -1;
+  for (let y = 0; y < pad.height; y++)
+    for (let x = 0; x < pad.width; x++)
+      if (data[(y * pad.width + x) * 4 + 3] > 0) {  // alpha > 0 means ink
+        if (x < minX) minX = x; if (x > maxX) maxX = x;
+        if (y < minY) minY = y; if (y > maxY) maxY = y;
+      }
+  if (maxX < 0) return null;  // empty canvas
+
+  const w = maxX - minX + 1, h = maxY - minY + 1, scale = 20 / Math.max(w, h);
+  const sw = Math.max(1, Math.round(w * scale)), sh = Math.max(1, Math.round(h * scale));
+  const small = document.createElement('canvas');
+  small.width = small.height = 28;
+  const sctx = small.getContext('2d');
+  sctx.imageSmoothingQuality = 'high';
+  sctx.fillStyle = '#000';
+  sctx.fillRect(0, 0, 28, 28);
+  sctx.drawImage(pad, minX, minY, w, h, Math.floor((28 - sw) / 2), Math.floor((28 - sh) / 2), sw, sh);
+
+  const px = sctx.getImageData(0, 0, 28, 28).data;
+  const a = new Float32Array(784);
+  let sum = 0, cx = 0, cy = 0;
+  for (let i = 0; i < 784; i++) {
+    a[i] = px[i * 4] / 255;
+    sum += a[i]; cx += (i % 28) * a[i]; cy += Math.floor(i / 28) * a[i];
+  }
+  const dx = Math.round(14 - cx / sum), dy = Math.round(14 - cy / sum);
+
+  const out = new Float32Array(784).fill(-MEAN / STD);  // normalized black
+  for (let y = 0; y < 28; y++)
+    for (let x = 0; x < 28; x++) {
+      const ny = y + dy, nx = x + dx;
+      if (ny >= 0 && ny < 28 && nx >= 0 && nx < 28) out[ny * 28 + nx] = (a[y * 28 + x] - MEAN) / STD;
+    }
+  return new ort.Tensor('float32', out, [1, 1, 28, 28]);
+}
+
+async function predict() {
+  const input = toMnist();
+  if (!input || !session) return;
+  const logits = (await session.run({ input })).logits.data;
+  const exps = Array.from(logits, v => Math.exp(v - Math.max(...logits)));
+  const total = exps.reduce((s, v) => s + v, 0);
+  const probs = exps.map(v => v / total);
+  const order = [...probs.keys()].sort((a, b) => probs[b] - probs[a]);
+  const conf = probs[order[0]];
+
+  $('result').textContent = `Result: ${order[0]}`;
+  $('confidence').textContent = `Confidence: ${(conf * 100).toFixed(1)}%`;
+  $('confidence').style.color = conf >= 0.9 ? 'green' : conf >= 0.6 ? 'darkorange' : 'red';
+  $('others').textContent = 'Next: ' + order.slice(1, 3).map(d => `${d} (${(probs[d] * 100).toFixed(1)}%)`).join(', ');
+  console.log(`Result: ${order[0]}  Confidence: ${(conf * 100).toFixed(1)}%`);
+}
+
+// Drawing: white strokes on a black background, like MNIST.
+ctx.lineWidth = 20;
+ctx.lineCap = ctx.lineJoin = 'round';
+ctx.strokeStyle = '#fff';
+const pos = e => {
+  const r = pad.getBoundingClientRect();
+  return [(e.clientX - r.left) * pad.width / r.width, (e.clientY - r.top) * pad.height / r.height];
+};
+pad.addEventListener('pointerdown', e => {
+  drawing = true;
+  pad.setPointerCapture(e.pointerId);
+  ctx.beginPath(); ctx.moveTo(...pos(e)); ctx.lineTo(...pos(e)); ctx.stroke();
+});
+pad.addEventListener('pointermove', e => { if (drawing) { ctx.lineTo(...pos(e)); ctx.stroke(); } });
+pad.addEventListener('pointerup', () => { drawing = false; predict(); });
+$('clear').onclick = () => {
+  ctx.clearRect(0, 0, pad.width, pad.height);
+  $('result').textContent = 'Draw a digit';
+  $('confidence').textContent = $('others').textContent = '';
+};
+
+ort.InferenceSession.create('mnist_cnn.onnx')
+  .then(s => { session = s; $('result').textContent = 'Draw a digit'; })
+  .catch(err => { $('result').textContent = 'Failed to load model'; console.error(err); });
+</script>
+</body>
+</html>

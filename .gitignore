@@ -1,0 +1,5 @@
+# Created: 2026-09-28 21:45
+# MNIST dataset (64 MB) is re-downloaded automatically when training.
+desktop_version/data/
+__pycache__/
+*.lnk
